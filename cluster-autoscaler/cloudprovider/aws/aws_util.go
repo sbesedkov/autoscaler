@@ -17,17 +17,18 @@ limitations under the License.
 package aws
 
 import (
-	"encoding/json"
+	"encoding/csv"
 	"errors"
 	"fmt"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/ec2metadata"
 	"github.com/aws/aws-sdk-go/aws/endpoints"
 	"github.com/aws/aws-sdk-go/aws/session"
-	"io/ioutil"
+	"io"
 	klog "k8s.io/klog/v2"
 	"net/http"
 	"os"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -35,26 +36,18 @@ import (
 
 var (
 	ec2MetaDataServiceUrl          = "http://169.254.169.254"
-	ec2PricingServiceUrlTemplate   = "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/%s/index.json"
-	ec2PricingServiceUrlTemplateCN = "https://pricing.cn-north-1.amazonaws.com.cn/offers/v1.0/cn/AmazonEC2/current/%s/index.json"
+	ec2PricingServiceUrlTemplate   = "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/%s/index.csv"
+	ec2PricingServiceUrlTemplateCN = "https://pricing.cn-north-1.amazonaws.com.cn/offers/v1.0/cn/AmazonEC2/current/%s/index.csv"
 	staticListLastUpdateTime       = "2020-12-07"
 	ec2Arm64Processors             = []string{"AWS Graviton Processor", "AWS Graviton2 Processor"}
 )
 
-type response struct {
-	Products map[string]product `json:"products"`
-}
-
-type product struct {
-	Attributes productAttributes `json:"attributes"`
-}
-
-type productAttributes struct {
-	InstanceType string `json:"instanceType"`
-	VCPU         string `json:"vcpu"`
-	Memory       string `json:"memory"`
-	GPU          string `json:"gpu"`
-	Architecture string `json:"physicalProcessor"`
+type attrIndex struct {
+  InstanceType  int64 `hdr:"Instance Type"`
+  VCPU          int64 `hdr:"vCPU"`
+  Memory        int64 `hdr:"Memory"`
+  Architecture  int64 `hdr:"Processor Architecture"`
+  GPU           int64 `hdr:"GPU"`
 }
 
 // GenerateEC2InstanceTypes returns a map of ec2 resources
@@ -87,36 +80,62 @@ func GenerateEC2InstanceTypes(region string) (map[string]*InstanceType, error) {
 
 			defer res.Body.Close()
 
-			body, err := ioutil.ReadAll(res.Body)
-			if err != nil {
+            body := csv.NewReader(res.Body)
+            body.FieldsPerRecord = -1;
+
+            var header []string
+            // Skip first 5 lines and read header
+            for i := 0; i < 6; i++ {
+                row, err := body.Read()
+                if err != nil {
+                    header = nil
+                    break
+                }
+                header = row
+            }
+
+			if header == nil || len(header) == 0 {
 				klog.Warningf("Error parsing %s skipping...\n", url)
 				continue
 			}
 
-			var unmarshalled = response{}
-			err = json.Unmarshal(body, &unmarshalled)
+			idx, err := parseHeader(header)
 			if err != nil {
-				klog.Warningf("Error unmarshalling %s, skip...\n", url)
-				continue
+			    klog.Warningf("Error parsing header from %s. %s. Skipping\n", url, err)
+			    continue
 			}
 
-			for _, product := range unmarshalled.Products {
-				attr := product.Attributes
-				if attr.InstanceType != "" {
-					instanceTypes[attr.InstanceType] = &InstanceType{
-						InstanceType: attr.InstanceType,
+			for {
+				attr, err := body.Read()
+
+                if err == io.EOF {
+                  break
+                }
+                if err != nil {
+                  klog.Warningf("Error reading %s skipping...\n", url)
+                  break
+                }
+                if (len(attr) != len(header)) {
+                  klog.Warningf("Error parsing %s: invalid number of attributes. Skipping...\n", url)
+                  break
+                }
+
+				if attr[idx.InstanceType] != "" {
+				    instanceType := attr[idx.InstanceType]
+					instanceTypes[instanceType] = &InstanceType{
+						InstanceType: instanceType,
 					}
-					if attr.Memory != "" && attr.Memory != "NA" {
-						instanceTypes[attr.InstanceType].MemoryMb = parseMemory(attr.Memory)
+					if attr[idx.Memory] != "" && attr[idx.Memory] != "NA" {
+						instanceTypes[instanceType].MemoryMb = parseMemory(attr[idx.Memory])
 					}
-					if attr.VCPU != "" {
-						instanceTypes[attr.InstanceType].VCPU = parseCPU(attr.VCPU)
+					if attr[idx.VCPU] != "" {
+						instanceTypes[instanceType].VCPU = parseCPU(attr[idx.VCPU])
 					}
-					if attr.GPU != "" {
-						instanceTypes[attr.InstanceType].GPU = parseCPU(attr.GPU)
+					if attr[idx.GPU] != "" {
+						instanceTypes[instanceType].GPU = parseCPU(attr[idx.GPU])
 					}
-					if attr.Architecture != "" {
-						instanceTypes[attr.InstanceType].Architecture = parseArchitecture(attr.Architecture)
+					if attr[idx.Architecture] != "" {
+						instanceTypes[instanceType].Architecture = parseArchitecture(attr[idx.Architecture])
 					}
 				}
 			}
@@ -133,6 +152,28 @@ func GenerateEC2InstanceTypes(region string) (map[string]*InstanceType, error) {
 // GetStaticEC2InstanceTypes return pregenerated ec2 instance type list
 func GetStaticEC2InstanceTypes() (map[string]*InstanceType, string) {
 	return InstanceTypes, staticListLastUpdateTime
+}
+
+func parseHeader(header []string) (*attrIndex, error) {
+  idx := new(attrIndex)
+
+  headerIndex := make(map[string]int64)
+  for i, attr := range header {
+    headerIndex[attr] = int64(i)
+  }
+
+  rIdx = reflect.Indirect(reflect.ValueOf(idx))
+
+  for i := 0; i < rIdx.NumField(); i++ {
+    title := rIdx.Type().Field(i).Tag.Get("hdr")
+    if _, exists := headerIndex[title]; !exists {
+        return nil, fmt.Errorf("No %s found in header", title)
+    }
+
+    rIdx.Field(i).SetInt(headerIndex[title])
+  }
+
+  return idx, nil
 }
 
 func parseMemory(memory string) int64 {
